@@ -15,98 +15,64 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import FMDB
 import Foundation
+import Security
 
 class SQLiteKeyValueStore {
-	private let db: FMDatabase
+	var db: SQLiteDBBacisWrapper?
 
-	/// - parameter url: URL on disk where the FMDB should be initialized
+	/// - parameter url: URL on disk where the SQLite DB should be initialized
 	init(with url: URL) {
 		let sqlStmt = """
 		CREATE TABLE IF NOT EXISTS kv (
-		    key TEXT UNIQUE,
-		    value BLOB
+			key TEXT UNIQUE,
+			value BLOB
 		);
 		"""
 
-		db = FMDatabase(url: url)
-		db.open()
-		db.executeStatements(sqlStmt)
-	}
-
-	deinit {
-		db.close()
-	}
-
-	private func openDbIfNeeded() {
-		if !db.isOpen {
-			db.open()
+		db = nil
+		var key: String
+		if let keyData = loadFromKeychain(key: "dbKey") {
+			key = String(decoding: keyData, as: UTF8.self)
+		} else {
+			key = UUID().uuidString
+			if savetoKeychain(key: "dbKey", data: Data(key.utf8)) == noErr {
+				logError(message: "Unable to open save Key to Keychain")
+			}
+		}
+		do {
+			db = try SQLiteDBBacisWrapper.open(path: url.absoluteString, secret: key)
+			log(message: "Successfully opened connection to database.", level: .info)
+			try db?.createTable(sql: sqlStmt)
+		} catch {
+			logError(message: "Unable to open Database")
+			return
 		}
 	}
 
 	private func getData(for key: String) -> Data? {
-		openDbIfNeeded()
-
-		do {
-			let query = "SELECT value FROM kv WHERE key = ?;"
-			let result = try db.executeQuery(query, values: [key])
-			var resultData = Data()
-			while result.next() {
-				guard let data = result.data(forColumn: "value") else {
-					return nil
-				}
-				resultData = data
-			}
-
-			result.close()
-
-			return resultData
-		} catch {
-			logError(message: "Failed to retrieve value from K/V SQLite store: \(error.localizedDescription)")
-			return nil
-		}
+		return db?.getValue(key: key)
 	}
 
 	private func setData(_ data: Data?, for key: String) {
-		openDbIfNeeded()
 		guard let data = data else {
 			return
 		}
-
-		/// Insert the key/value pair if it isn't already in the Database, otherwise Update the value
-		let upsertStmt = "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value = ?"
 		do {
-			try db.executeUpdate(upsertStmt, values: [key, data, data])
+			try db?.insertKeyValue(key: key, data: data)
 		} catch {
-			logError(message: "Failed to insert key/V pair into K/V SQLite store: \(error.localizedDescription)")
+			return
 		}
 	}
 
 	func clearAll() {
-		openDbIfNeeded()
-		let deleteStmt = "DELETE FROM kv;"
-		do {
-			try db.executeUpdate(deleteStmt, values: [])
-			try db.executeUpdate("VACUUM", values: [])
-			log(message: "Cleared SecureStore", level: .info)
-		} catch {
-			logError(message: "Failed to delete key from K/V SQLite store: \(error.localizedDescription)")
-		}
-		return
+		db?.clearAll()
+		db?.vacuum()
 	}
 
 	func flush() {
-		openDbIfNeeded()
-		let deleteStmt = "DELETE FROM kv WHERE key NOT IN('developerSubmissionBaseURLOverride','developerDistributionBaseURLOverride','developerVerificationBaseURLOverride');"
-		do {
-			try db.executeUpdate(deleteStmt, values: [])
-			try db.executeUpdate("VACUUM", values: [])
-			log(message: "Flushed SecureStore", level: .info)
-		} catch {
-			logError(message: "Failed to delete key from K/V SQLite store: \(error.localizedDescription)")
-		}
-		return
+		db?.clearAll()
+		db?.vacuum()
 	}
 
 	subscript(key: String) -> Data? {
@@ -124,8 +90,12 @@ class SQLiteKeyValueStore {
 			guard let data = getData(for: key) else {
 				return nil
 			}
-			// TODO: Error handling
-			return try? JSONDecoder().decode(Model.self, from: data)
+			do {
+				return try JSONDecoder().decode(Model.self, from: data)
+			} catch {
+				logError(message: "Error when decoding value for reading from K/V SQLite store: \(error.localizedDescription)")
+				return nil
+			}
 		}
 		set {
 			do {
@@ -136,4 +106,43 @@ class SQLiteKeyValueStore {
 			}
 		}
 	}
+}
+
+/// Keychain Extension for storing and loading the Database Key in the Keychain
+extension SQLiteKeyValueStore {
+	func savetoKeychain(key: String, data: Data) -> OSStatus {
+		let query = [
+			kSecClass as String: kSecClassGenericPassword as String,
+			kSecAttrAccount as String: key,
+			kSecValueData as String: data ] as [String: Any]
+
+		SecItemDelete(query as CFDictionary)
+		return SecItemAdd(query as CFDictionary, nil)
+	}
+
+	func loadFromKeychain(key: String) -> Data? {
+		let query = [
+			kSecClass as String: kSecClassGenericPassword,
+			kSecAttrAccount as String: key,
+			kSecReturnData as String: kCFBooleanTrue!,
+			kSecMatchLimit as String: kSecMatchLimitOne] as [String: Any]
+
+		var dataTypeRef: AnyObject?
+		let status: OSStatus = SecItemCopyMatching(query as CFDictionary, &dataTypeRef)
+		if status == noErr {
+			return dataTypeRef as? Data ?? nil
+		} else {
+			return nil
+		}
+	}
+}
+extension Data {
+    init<T>(from value: T) {
+        var value = value
+        self.init(buffer: UnsafeBufferPointer(start: &value, count: 1))
+    }
+
+    func to<T>(type: T.Type) -> T {
+        return self.withUnsafeBytes { $0.load(as: T.self) }
+    }
 }
